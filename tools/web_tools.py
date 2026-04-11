@@ -142,6 +142,98 @@ def _get_direct_firecrawl_config() -> Optional[tuple[Dict[str, str], tuple[str, 
     return kwargs, ("direct", api_url or None, api_key or None)
 
 
+def _get_direct_firecrawl_base_url() -> Optional[str]:
+    """Return a direct Firecrawl base URL normalized to the v2 API root."""
+    direct_config = _get_direct_firecrawl_config()
+    if direct_config is None:
+        return None
+
+    kwargs, _ = direct_config
+    api_url = (kwargs.get("api_url") or "").strip().rstrip("/")
+    if not api_url:
+        return None
+    if api_url.endswith("/v2"):
+        return api_url
+    return f"{api_url}/v2"
+
+
+def _firecrawl_direct_post(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST to a direct Firecrawl endpoint without the SDK dropping path prefixes.
+
+    Some reverse-proxied Firecrawl deployments live under a path prefix such as
+    ``/firecrawl/v2``. The upstream SDK builds requests with absolute ``/v2/...``
+    endpoints, which drops any existing prefix. Hermes uses this helper for direct
+    Firecrawl configs so path-based gateways work correctly.
+    """
+    direct_config = _get_direct_firecrawl_config()
+    if direct_config is None:
+        _raise_web_backend_configuration_error()
+
+    kwargs, _ = direct_config
+    api_key = (kwargs.get("api_key") or "").strip()
+    base_url = _get_direct_firecrawl_base_url()
+    if not base_url:
+        _raise_web_backend_configuration_error()
+
+    url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    request_payload = dict(payload)
+    request_payload.setdefault("origin", "hermes-agent")
+    response = httpx.post(url, headers=headers, json=request_payload, timeout=60)
+    response.raise_for_status()
+    body = response.json()
+    if not body.get("success", False):
+        raise ValueError(body.get("error") or f"Firecrawl {endpoint} failed")
+    return body
+
+
+
+
+def _firecrawl_search(query: str, limit: int = 5) -> dict:
+    """Search using Firecrawl, preferring direct HTTP for direct/path-based configs."""
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    logger.info("Firecrawl search: '%s' (limit=%d)", query, limit)
+
+    if _has_direct_firecrawl_config():
+        body = _firecrawl_direct_post("search", {
+            "query": query,
+            "limit": limit,
+        })
+        web_results = _extract_web_search_results(body)
+        return {"success": True, "data": {"web": web_results}}
+
+    response = _get_firecrawl_client().search(
+        query=query,
+        limit=limit,
+    )
+    web_results = _extract_web_search_results(response)
+    return {"success": True, "data": {"web": web_results}}
+
+
+def _firecrawl_scrape(url: str, formats: List[str]) -> Dict[str, Any]:
+    """Scrape via Firecrawl, preferring direct HTTP for direct/path-based configs."""
+    if _has_direct_firecrawl_config():
+        body = _firecrawl_direct_post("scrape", {
+            "url": url,
+            "formats": formats,
+        })
+        return _extract_scrape_payload(body)
+
+    scrape_result = _get_firecrawl_client().scrape(
+        url=url,
+        formats=formats,
+    )
+    return _extract_scrape_payload(scrape_result)
+
+
+
+
 def _get_firecrawl_gateway_url() -> str:
     """Return configured Firecrawl gateway URL."""
     return build_vendor_gateway_url("firecrawl")
@@ -1119,12 +1211,8 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
 
-        response = _get_firecrawl_client().search(
-            query=query,
-            limit=limit
-        )
-
-        web_results = _extract_web_search_results(response)
+        response_data = _firecrawl_search(query, limit)
+        web_results = response_data.get("data", {}).get("web", [])
         results_count = len(web_results)
         logger.info("Found %d search results", results_count)
         
@@ -1289,11 +1377,11 @@ async def web_extract_tool(
                         # Run synchronous Firecrawl scrape in a thread with a
                         # 60s timeout so a hung fetch doesn't block the session.
                         try:
-                            scrape_result = await asyncio.wait_for(
+                            scrape_payload = await asyncio.wait_for(
                                 asyncio.to_thread(
-                                    _get_firecrawl_client().scrape,
-                                    url=url,
-                                    formats=formats,
+                                    _firecrawl_scrape,
+                                    url,
+                                    formats,
                                 ),
                                 timeout=60,
                             )
@@ -1304,8 +1392,6 @@ async def web_extract_tool(
                                 "error": "Scrape timed out after 60s — page may be too large or unresponsive. Try browser_navigate instead.",
                             })
                             continue
-
-                        scrape_payload = _extract_scrape_payload(scrape_result)
                         metadata = scrape_payload.get("metadata", {})
                         title = ""
                         content_markdown = scrape_payload.get("markdown")
@@ -1674,6 +1760,12 @@ async def web_crawl_tool(
         from tools.interrupt import is_interrupted as _is_int
         if _is_int():
             return tool_error("Interrupted", success=False)
+
+        if _has_direct_firecrawl_config():
+            return json.dumps({
+                "error": "web_crawl is not supported yet for this path-prefixed Firecrawl proxy. scrape/search/extract work; crawl start works but status polling is not available through the same proxy.",
+                "success": False,
+            }, ensure_ascii=False)
 
         try:
             crawl_result = _get_firecrawl_client().crawl(

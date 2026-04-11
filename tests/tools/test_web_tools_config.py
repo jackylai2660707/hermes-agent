@@ -491,6 +491,74 @@ class TestParallelClientConfig:
             assert client1 is client2
 
 
+class TestDirectFirecrawlPathPrefix:
+    def setup_method(self):
+        import tools.web_tools
+        tools.web_tools._firecrawl_client = None
+        tools.web_tools._firecrawl_client_config = None
+
+    def teardown_method(self):
+        import tools.web_tools
+        tools.web_tools._firecrawl_client = None
+        tools.web_tools._firecrawl_client_config = None
+
+    def test_direct_firecrawl_base_url_preserves_v2_path_prefix(self):
+        with patch.dict(os.environ, {
+            "FIRECRAWL_API_URL": "https://search.mo.yueseng-ys.com/firecrawl/v2",
+            "FIRECRAWL_API_KEY": "fc-test",
+        }, clear=False):
+            from tools.web_tools import _get_direct_firecrawl_base_url
+            assert _get_direct_firecrawl_base_url() == "https://search.mo.yueseng-ys.com/firecrawl/v2"
+
+    def test_firecrawl_search_uses_direct_http_for_path_prefixed_instances(self):
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {
+            "success": True,
+            "data": {
+                "web": [
+                    {"url": "https://example.com", "title": "Example", "description": "desc", "position": 1}
+                ]
+            },
+        }
+
+        with patch.dict(os.environ, {
+            "FIRECRAWL_API_URL": "https://search.mo.yueseng-ys.com/firecrawl/v2",
+            "FIRECRAWL_API_KEY": "fc-test",
+        }, clear=False), \
+             patch("tools.web_tools.httpx.post", return_value=mock_response) as mock_post, \
+             patch("tools.interrupt.is_interrupted", return_value=False):
+            from tools.web_tools import _firecrawl_search
+            result = _firecrawl_search("example domain", 3)
+
+        assert result["success"] is True
+        mock_post.assert_called_once()
+        assert mock_post.call_args.args[0] == "https://search.mo.yueseng-ys.com/firecrawl/v2/search"
+
+    def test_firecrawl_scrape_uses_direct_http_for_path_prefixed_instances(self):
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {
+            "success": True,
+            "data": {
+                "markdown": "# Example Domain",
+                "metadata": {"title": "Example Domain", "sourceURL": "https://example.com"},
+            },
+        }
+
+        with patch.dict(os.environ, {
+            "FIRECRAWL_API_URL": "https://search.mo.yueseng-ys.com/firecrawl/v2",
+            "FIRECRAWL_API_KEY": "fc-test",
+        }, clear=False), \
+             patch("tools.web_tools.httpx.post", return_value=mock_response) as mock_post:
+            from tools.web_tools import _firecrawl_scrape
+            payload = _firecrawl_scrape("https://example.com", ["markdown"])
+
+        assert payload["markdown"] == "# Example Domain"
+        mock_post.assert_called_once()
+        assert mock_post.call_args.args[0] == "https://search.mo.yueseng-ys.com/firecrawl/v2/scrape"
+
+
 class TestWebSearchErrorHandling:
     """Test suite for web_search_tool() error responses."""
 
