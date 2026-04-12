@@ -181,13 +181,102 @@ def _firecrawl_direct_post(endpoint: str, payload: Dict[str, Any]) -> Dict[str, 
         headers["Authorization"] = f"Bearer {api_key}"
 
     request_payload = dict(payload)
-    request_payload.setdefault("origin", "hermes-agent")
     response = httpx.post(url, headers=headers, json=request_payload, timeout=60)
     response.raise_for_status()
     body = response.json()
     if not body.get("success", False):
         raise ValueError(body.get("error") or f"Firecrawl {endpoint} failed")
     return body
+
+
+def _firecrawl_direct_get(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """GET a direct Firecrawl endpoint without losing any configured path prefix."""
+    direct_config = _get_direct_firecrawl_config()
+    if direct_config is None:
+        _raise_web_backend_configuration_error()
+
+    kwargs, _ = direct_config
+    api_key = (kwargs.get("api_key") or "").strip()
+    base_url = _get_direct_firecrawl_base_url()
+    if not base_url:
+        _raise_web_backend_configuration_error()
+
+    url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    response = httpx.get(url, headers=headers, params=params or {}, timeout=60)
+    response.raise_for_status()
+    body = response.json()
+    if isinstance(body, dict) and body.get("success") is False:
+        raise ValueError(body.get("error") or f"Firecrawl {endpoint} failed")
+    return body
+
+
+async def _firecrawl_direct_crawl(url: str, crawl_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Start and poll a direct Firecrawl crawl until it returns page data.
+
+    The direct proxy only needs a compact crawl payload; extra request fields can
+    trigger 400s on some Firecrawl deployments, so keep the submission minimal and
+    let the proxy/backend defaults do the rest.
+    """
+    create_payload = {
+        "url": url,
+        "limit": int(crawl_params.get("limit", 20) or 20),
+    }
+    body = _firecrawl_direct_post("crawl", create_payload)
+
+    if isinstance(body, dict) and isinstance(body.get("data"), list) and body.get("data"):
+        return {"data": body["data"]}
+
+    job_id = str(body.get("id") or body.get("jobId") or "").strip()
+    if not job_id:
+        if isinstance(body, dict) and "data" in body:
+            return {"data": body.get("data") or []}
+        raise ValueError("Firecrawl crawl did not return a job id")
+
+    poll_interval = 2.0
+    timeout_seconds = 180.0
+    deadline = asyncio.get_event_loop().time() + timeout_seconds
+    last_body: Dict[str, Any] = body if isinstance(body, dict) else {}
+    in_progress_states = {"queued", "pending", "processing", "scraping", "running", "started"}
+
+    while True:
+        now = asyncio.get_event_loop().time()
+        if now >= deadline:
+            break
+        try:
+            polled = _firecrawl_direct_get(f"crawl/{job_id}")
+        except Exception as exc:
+            # Some path-prefixed proxies briefly return 404/502 before the job is
+            # visible in the local job store. Keep retrying until the deadline.
+            error_text = str(exc).lower()
+            if any(code in error_text for code in ("404", "502", "503", "504", "429")):
+                await asyncio.sleep(poll_interval)
+                continue
+            raise
+        if isinstance(polled, dict):
+            last_body = polled
+            status = str(polled.get("status") or "").strip().lower()
+            data = polled.get("data")
+            completed = polled.get("completed")
+            total = polled.get("total")
+            if isinstance(data, list) and data and status not in in_progress_states:
+                return {"data": data}
+            if (
+                isinstance(data, list)
+                and data
+                and isinstance(completed, int)
+                and isinstance(total, int)
+                and completed >= total
+            ):
+                return {"data": data}
+        await asyncio.sleep(poll_interval)
+
+    if isinstance(last_body, dict) and isinstance(last_body.get("data"), list) and last_body.get("data"):
+        return {"data": last_body["data"]}
+    raise TimeoutError(f"Firecrawl crawl job {job_id} did not complete within {timeout_seconds:.0f}s")
 
 
 
@@ -231,6 +320,32 @@ def _firecrawl_scrape(url: str, formats: List[str]) -> Dict[str, Any]:
     )
     return _extract_scrape_payload(scrape_result)
 
+
+def _firecrawl_map(url: str, limit: int = 20) -> Dict[str, Any]:
+    """Map a site via Firecrawl, preferring direct HTTP for direct/path-based configs."""
+    if _has_direct_firecrawl_config():
+        body = _firecrawl_direct_post("map", {
+            "url": url,
+            "limit": limit,
+        })
+        links = body.get("links")
+        if not isinstance(links, list):
+            data = body.get("data") if isinstance(body.get("data"), dict) else {}
+            links = data.get("links", []) if isinstance(data, dict) else []
+        return {"success": True, "data": {"links": links}}
+
+    map_result = _get_firecrawl_client().map(
+        url=url,
+        options={"limit": limit},
+    )
+    result_plain = _to_plain_object(map_result)
+    if isinstance(result_plain, dict):
+        links = result_plain.get("links")
+        if not isinstance(links, list):
+            data = result_plain.get("data") if isinstance(result_plain.get("data"), dict) else {}
+            links = data.get("links", []) if isinstance(data, dict) else []
+        return {"success": True, "data": {"links": links}}
+    return {"success": True, "data": {"links": []}}
 
 
 
@@ -1575,6 +1690,73 @@ async def web_extract_tool(
         return tool_error(error_msg)
 
 
+def web_map_tool(
+    url: str,
+    limit: int = 20,
+) -> str:
+    """
+    Map a website and return discovered links using the configured Firecrawl backend.
+
+    This is a lightweight companion to web_search / web_extract that helps discover
+    site structure and seed URLs for targeted extraction.
+    """
+    debug_call_data = {
+        "parameters": {
+            "url": url,
+            "limit": limit,
+        },
+        "error": None,
+        "links_count": 0,
+        "original_response_size": 0,
+        "final_response_size": 0,
+    }
+
+    try:
+        from tools.interrupt import is_interrupted
+        if is_interrupted():
+            return tool_error("Interrupted", success=False)
+
+        backend = _get_backend()
+        if backend != "firecrawl":
+            return json.dumps({
+                "error": "web_map requires Firecrawl. Set FIRECRAWL_API_KEY or FIRECRAWL_API_URL to use mapping.",
+                "success": False,
+            }, ensure_ascii=False)
+
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+            logger.info("Added https:// prefix to URL: %s", url)
+
+        if not is_safe_url(url):
+            return json.dumps({"results": [{"url": url, "title": "", "content": "",
+                "error": "Blocked: URL targets a private or internal network address"}]}, ensure_ascii=False)
+
+        blocked = check_website_access(url)
+        if blocked:
+            logger.info("Blocked web_map for %s by rule %s", blocked["host"], blocked["rule"])
+            return json.dumps({"results": [{"url": url, "title": "", "content": "", "error": blocked["message"],
+                "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]}}]}, ensure_ascii=False)
+
+        logger.info("Mapping website: %s (limit: %d)", url, limit)
+        response_data = _firecrawl_map(url, limit)
+        links = response_data.get("data", {}).get("links", [])
+        debug_call_data["links_count"] = len(links)
+        debug_call_data["original_response_size"] = len(json.dumps(response_data, ensure_ascii=False))
+        result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+        debug_call_data["final_response_size"] = len(result_json)
+        _debug.log_call("web_map_tool", debug_call_data)
+        _debug.save()
+        return result_json
+
+    except Exception as e:
+        error_msg = f"Error mapping website: {str(e)}"
+        logger.debug("%s", error_msg)
+        debug_call_data["error"] = error_msg
+        _debug.log_call("web_map_tool", debug_call_data)
+        _debug.save()
+        return tool_error(error_msg)
+
+
 async def web_crawl_tool(
     url: str, 
     instructions: str = None, 
@@ -1762,19 +1944,16 @@ async def web_crawl_tool(
             return tool_error("Interrupted", success=False)
 
         if _has_direct_firecrawl_config():
-            return json.dumps({
-                "error": "web_crawl is not supported yet for this path-prefixed Firecrawl proxy. scrape/search/extract work; crawl start works but status polling is not available through the same proxy.",
-                "success": False,
-            }, ensure_ascii=False)
-
-        try:
-            crawl_result = _get_firecrawl_client().crawl(
-                url=url,
-                **crawl_params
-            )
-        except Exception as e:
-            logger.debug("Crawl API call failed: %s", e)
-            raise
+            crawl_result = await _firecrawl_direct_crawl(url, crawl_params)
+        else:
+            try:
+                crawl_result = _get_firecrawl_client().crawl(
+                    url=url,
+                    **crawl_params
+                )
+            except Exception as e:
+                logger.debug("Crawl API call failed: %s", e)
+                raise
 
         pages: List[Dict[str, Any]] = []
         
@@ -2154,6 +2333,27 @@ WEB_SEARCH_SCHEMA = {
     }
 }
 
+WEB_MAP_SCHEMA = {
+    "name": "web_map",
+    "description": "Map a website and return discovered links to help find relevant pages for deeper extraction. Returns a list of URLs with optional titles and descriptions.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The base URL or domain to map"
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of links to return (default 20)",
+                "minimum": 1,
+                "maximum": 100
+            }
+        },
+        "required": ["url"]
+    }
+}
+
 WEB_EXTRACT_SCHEMA = {
     "name": "web_extract",
     "description": "Extract content from web page URLs. Returns page content in markdown format. Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text. Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page. Pages over 2M chars are refused. If a URL fails or times out, use the browser tool to access it instead.",
@@ -2179,6 +2379,16 @@ registry.register(
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
     emoji="🔍",
+    max_result_size_chars=100_000,
+)
+registry.register(
+    name="web_map",
+    toolset="web",
+    schema=WEB_MAP_SCHEMA,
+    handler=lambda args, **kw: web_map_tool(args.get("url", ""), limit=min(max(int(args.get("limit", 20) or 20), 1), 100)),
+    check_fn=check_web_api_key,
+    requires_env=_web_requires_env(),
+    emoji="🗺️",
     max_result_size_chars=100_000,
 )
 registry.register(

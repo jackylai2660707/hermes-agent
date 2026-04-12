@@ -558,6 +558,29 @@ class TestDirectFirecrawlPathPrefix:
         mock_post.assert_called_once()
         assert mock_post.call_args.args[0] == "https://search.mo.yueseng-ys.com/firecrawl/v2/scrape"
 
+    def test_firecrawl_map_uses_direct_http_for_path_prefixed_instances(self):
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {
+            "success": True,
+            "links": [
+                {"url": "https://example.com/docs", "title": "Docs", "description": "docs"}
+            ],
+        }
+
+        with patch.dict(os.environ, {
+            "FIRECRAWL_API_URL": "https://search.mo.yueseng-ys.com/firecrawl/v2",
+            "FIRECRAWL_API_KEY": "fc-test",
+        }, clear=False), \
+             patch("tools.web_tools.httpx.post", return_value=mock_response) as mock_post:
+            from tools.web_tools import _firecrawl_map
+            payload = _firecrawl_map("https://example.com", 20)
+
+        assert payload["success"] is True
+        assert payload["data"]["links"][0]["url"] == "https://example.com/docs"
+        mock_post.assert_called_once()
+        assert mock_post.call_args.args[0] == "https://search.mo.yueseng-ys.com/firecrawl/v2/map"
+
 
 class TestWebSearchErrorHandling:
     """Test suite for web_search_tool() error responses."""
