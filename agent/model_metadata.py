@@ -107,6 +107,13 @@ DEFAULT_CONTEXT_LENGTHS = {
     "claude": 200000,
     # OpenAI
     "gpt-4.1": 1047576,
+    # GPT-5.4 family — official docs advertise 1,050,000 context for
+    # GPT-5.4 / Pro, and 400,000 for GPT-5.4 mini / nano.
+    # These explicit keys must sort ahead of the generic "gpt-5" fallback.
+    "gpt-5.4-pro": 1_050_000,
+    "gpt-5.4-mini": 400_000,
+    "gpt-5.4-nano": 400_000,
+    "gpt-5.4": 1_050_000,
     "gpt-5": 128000,
     "gpt-4": 128000,
     # Google
