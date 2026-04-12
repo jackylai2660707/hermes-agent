@@ -33,6 +33,10 @@ class TestFirecrawlClientConfig:
             "TOOL_GATEWAY_DOMAIN",
             "TOOL_GATEWAY_SCHEME",
             "TOOL_GATEWAY_USER_TOKEN",
+            "EXA_API_KEY",
+            "EXA_API_URL",
+            "TAVILY_API_KEY",
+            "TAVILY_API_URL",
         ):
             os.environ.pop(key, None)
         os.environ["HERMES_ENABLE_NOUS_MANAGED_TOOLS"] = "1"
@@ -50,6 +54,10 @@ class TestFirecrawlClientConfig:
             "TOOL_GATEWAY_DOMAIN",
             "TOOL_GATEWAY_SCHEME",
             "TOOL_GATEWAY_USER_TOKEN",
+            "EXA_API_KEY",
+            "EXA_API_URL",
+            "TAVILY_API_KEY",
+            "TAVILY_API_URL",
         ):
             os.environ.pop(key, None)
 
@@ -64,6 +72,12 @@ class TestFirecrawlClientConfig:
                 mock_fc.assert_called_once_with(api_key="fc-test")
                 assert result is mock_fc.return_value
 
+    def test_exa_proxy_base_url_override_does_not_break_direct_key(self):
+        """EXA_API_URL should be accepted as backend availability and passed through."""
+        with patch.dict(os.environ, {"EXA_API_KEY": "exa-test", "EXA_API_URL": "https://mysearch.example/exa"}):
+            from tools.web_tools import _get_backend
+            assert _get_backend() == "exa"
+
     def test_self_hosted_with_key(self):
         """Both key + URL → self-hosted with auth."""
         with patch.dict(os.environ, {
@@ -77,6 +91,12 @@ class TestFirecrawlClientConfig:
                     api_key="fc-test", api_url="http://localhost:3002"
                 )
                 assert result is mock_fc.return_value
+
+    def test_tavily_proxy_base_url_override_is_accepted(self):
+        """TAVILY_API_URL should be accepted as backend availability."""
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test", "TAVILY_API_URL": "https://mysearch.example/tavily"}):
+            from tools.web_tools import _get_backend
+            assert _get_backend() == "tavily"
 
     def test_self_hosted_no_key(self):
         """URL only, no key → self-hosted without auth."""

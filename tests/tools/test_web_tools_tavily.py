@@ -45,6 +45,18 @@ class TestTavilyRequest:
                 assert payload["query"] == "hello"
                 assert "api.tavily.com/search" in call_kwargs.args[0]
 
+    def test_uses_proxy_base_url_override(self):
+        """TAVILY_API_URL should override the upstream base URL."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"results": []}
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test-key", "TAVILY_API_URL": "https://mysearch.example/tavily"}):
+            with patch("tools.web_tools.httpx.post", return_value=mock_response) as mock_post:
+                from tools.web_tools import _tavily_request
+                _tavily_request("search", {"query": "hello"})
+                assert mock_post.call_args.args[0] == "https://mysearch.example/tavily/search"
+
     def test_raises_on_http_error(self):
         """Non-2xx responses propagate as httpx.HTTPStatusError."""
         import httpx as _httpx

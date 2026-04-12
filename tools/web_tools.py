@@ -97,8 +97,8 @@ def _get_backend() -> str:
     backend_candidates = (
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
-        ("tavily", _has_env("TAVILY_API_KEY")),
-        ("exa", _has_env("EXA_API_KEY")),
+        ("tavily", _has_env("TAVILY_API_KEY") or _has_env("TAVILY_API_URL")),
+        ("exa", _has_env("EXA_API_KEY") or _has_env("EXA_API_URL")),
     )
     for backend, available in backend_candidates:
         if available:
@@ -495,6 +495,8 @@ def _tavily_request(endpoint: str, payload: dict) -> dict:
     """Send a POST request to the Tavily API.
 
     Auth is provided via ``api_key`` in the JSON body (no header-based auth).
+    Supports either direct Tavily or a reverse-proxied base URL override via
+    ``TAVILY_API_URL``.
     Raises ``ValueError`` if ``TAVILY_API_KEY`` is not set.
     """
     api_key = os.getenv("TAVILY_API_KEY")
@@ -503,8 +505,9 @@ def _tavily_request(endpoint: str, payload: dict) -> dict:
             "TAVILY_API_KEY environment variable not set. "
             "Get your API key at https://app.tavily.com/home"
         )
+    base_url = os.getenv("TAVILY_API_URL", "").strip() or _TAVILY_BASE_URL
     payload["api_key"] = api_key
-    url = f"{_TAVILY_BASE_URL}/{endpoint.lstrip('/')}"
+    url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
     response = httpx.post(url, json=payload, timeout=60)
     response.raise_for_status()
@@ -1084,18 +1087,19 @@ _exa_client = None
 def _get_exa_client():
     """Get or create the Exa client (lazy initialization).
 
-    Requires EXA_API_KEY environment variable.
+    Supports either EXA_API_KEY (direct) or EXA_API_URL (proxy/base URL override).
     """
     from exa_py import Exa
     global _exa_client
     if _exa_client is None:
         api_key = os.getenv("EXA_API_KEY")
+        base_url = os.getenv("EXA_API_URL", "").strip() or "https://api.exa.ai"
         if not api_key:
             raise ValueError(
                 "EXA_API_KEY environment variable not set. "
                 "Get your API key at https://exa.ai"
             )
-        _exa_client = Exa(api_key=api_key)
+        _exa_client = Exa(api_key=api_key, base_url=base_url)
         _exa_client.headers["x-exa-integration"] = "hermes-agent"
     return _exa_client
 
