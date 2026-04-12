@@ -857,6 +857,21 @@ def _normalize_model_version(model: str) -> str:
     return model.replace(".", "-")
 
 
+def _lookup_exact_default_context_length(model: str) -> Optional[int]:
+    """Return a hardcoded default only for an exact model-ID match.
+
+    This is safer than the generic substring fallback for unknown custom
+    endpoints: it fixes well-known bare model IDs like ``gpt-5.4-mini``
+    without incorrectly mapping unrelated custom IDs such as
+    ``zai-org/GLM-5-TEE`` to the generic ``glm`` family default.
+    """
+    normalized = _strip_provider_prefix(model).strip().lower()
+    for default_model, length in DEFAULT_CONTEXT_LENGTHS.items():
+        if default_model.lower() == normalized:
+            return length
+    return None
+
+
 def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> Optional[int]:
     """Query Anthropic's /v1/models endpoint for context length.
 
@@ -986,6 +1001,9 @@ def get_model_context_length(
                 if local_ctx and local_ctx > 0:
                     save_context_length(model, base_url, local_ctx)
                     return local_ctx
+            exact_default = _lookup_exact_default_context_length(model)
+            if exact_default is not None:
+                return exact_default
             logger.info(
                 "Could not detect context length for model %r at %s — "
                 "defaulting to %s tokens (probe-down). Set model.context_length "

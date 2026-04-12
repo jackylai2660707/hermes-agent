@@ -304,6 +304,21 @@ class TestGetModelContextLength:
 
     @patch("agent.model_metadata.fetch_model_metadata")
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_custom_endpoint_without_metadata_uses_exact_hardcoded_default(self, mock_endpoint_fetch, mock_fetch):
+        """Unknown custom endpoints may still use exact hardcoded defaults for well-known model IDs."""
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {}
+
+        result = get_model_context_length(
+            "gpt-5.4-mini",
+            base_url="https://api.yueseng-ys.com/v1",
+            api_key="test-key",
+        )
+
+        assert result == 400000
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
     def test_custom_endpoint_without_metadata_skips_name_based_default(self, mock_endpoint_fetch, mock_fetch):
         mock_fetch.return_value = {}
         mock_endpoint_fetch.return_value = {}
