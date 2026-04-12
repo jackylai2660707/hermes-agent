@@ -7,11 +7,13 @@ turn counting, tags), and schema completeness.
 
 import json
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hindsight_embed.profile_manager import ProfileManager
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
     RECALL_SCHEMA,
@@ -19,6 +21,7 @@ from plugins.memory.hindsight import (
     RETAIN_SCHEMA,
     _load_config,
 )
+
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +207,22 @@ class TestConfig:
         assert cfg["banks"]["hermes"]["bankId"] == "env-bank"
         assert cfg["banks"]["hermes"]["budget"] == "high"
 
+
+class TestHindsightEmbedPaths:
+    def test_profile_manager_honors_hindsight_home_override(self, tmp_path, monkeypatch):
+        hindsight_home = tmp_path / "hindsight-state"
+        monkeypatch.setenv("HINDSIGHT_HOME", str(hindsight_home))
+        monkeypatch.setenv("HOME", str(tmp_path / "root-home"))
+
+        manager = ProfileManager()
+        default_paths = manager.resolve_profile_paths("")
+        named_paths = manager.resolve_profile_paths("alice")
+
+        expected_root = Path(hindsight_home)
+        assert default_paths.config == expected_root / "embed"
+        assert default_paths.lock == expected_root / "daemon.lock"
+        assert named_paths.config == expected_root / "profiles" / "alice.env"
+        assert named_paths.log == expected_root / "profiles" / "alice.log"
 
 # ---------------------------------------------------------------------------
 # Tool handler tests

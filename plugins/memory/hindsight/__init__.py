@@ -577,8 +577,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     # Update the profile .env to match our current config so
                     # the daemon always starts with the right settings.
                     # If the config changed and the daemon is running, stop it.
-                    from pathlib import Path as _Path
-                    profile_env = _Path.home() / ".hindsight" / "profiles" / f"{profile}.env"
+                    profile_env = get_hermes_home() / "hindsight" / "profiles" / f"{profile}.env"
                     current_key = self._config.get("llm_api_key") or os.environ.get("HINDSIGHT_LLM_API_KEY", "")
                     current_provider = self._config.get("llm_provider", "")
                     current_model = self._config.get("llm_model", "")
