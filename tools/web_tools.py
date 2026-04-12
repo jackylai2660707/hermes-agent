@@ -45,6 +45,7 @@ import logging
 import os
 import re
 import asyncio
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 import httpx
 from firecrawl import Firecrawl
@@ -53,6 +54,7 @@ from agent.auxiliary_client import (
     extract_content_or_reasoning,
     get_async_text_auxiliary_client,
 )
+from hermes_constants import get_hermes_home
 from tools.debug_helpers import DebugSession
 from tools.managed_tool_gateway import (
     build_vendor_gateway_url,
@@ -63,7 +65,42 @@ from tools.tool_backend_helpers import managed_nous_tools_enabled
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
+
 logger = logging.getLogger(__name__)
+
+
+def _bootstrap_web_env() -> None:
+    """Load Hermes env-file web credentials when the runtime env is empty.
+
+    This is intentionally conservative: it only fills in missing variables and
+    does not override any pre-existing process environment values.
+    """
+    env_path = get_hermes_home() / ".env"
+    if not env_path.exists():
+        return
+
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key or key in os.environ:
+                continue
+            value = value.strip()
+            if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                value = value[1:-1]
+            os.environ[key] = value
+    except Exception as exc:
+        logger.debug("Skipping Hermes env bootstrap: %s", exc)
+
+
+_bootstrap_web_env()
 
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
@@ -126,12 +163,28 @@ _firecrawl_client_config = None
 
 
 def _get_direct_firecrawl_config() -> Optional[tuple[Dict[str, str], tuple[str, Optional[str], Optional[str]]]]:
-    """Return explicit direct Firecrawl kwargs + cache key, or None when unset."""
+    """Return explicit direct Firecrawl kwargs + cache key, or None when unset.
+
+    When Firecrawl is routed through the user's MySearch proxy, prefer the shared
+    MySearch proxy token over any legacy Firecrawl key that may still exist in
+    the env file.
+    """
     api_key = os.getenv("FIRECRAWL_API_KEY", "").strip()
     api_url = os.getenv("FIRECRAWL_API_URL", "").strip().rstrip("/")
 
     if not api_key and not api_url:
         return None
+
+    mysearch_base = os.getenv("MYSEARCH_PROXY_BASE_URL", "").strip().rstrip("/")
+    mysearch_key = os.getenv("MYSEARCH_PROXY_API_KEY", "").strip()
+    if api_url and mysearch_base and mysearch_key:
+        try:
+            firecrawl_host = httpx.URL(api_url).host
+            mysearch_host = httpx.URL(mysearch_base).host
+            if firecrawl_host and mysearch_host and firecrawl_host == mysearch_host:
+                api_key = mysearch_key
+        except Exception:
+            pass
 
     kwargs: Dict[str, str] = {}
     if api_key:
