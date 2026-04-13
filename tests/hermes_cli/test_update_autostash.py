@@ -116,6 +116,20 @@ def test_restore_stashed_changes_can_skip_restore_and_keep_stash(monkeypatch, tm
     assert "git stash apply abc123" in out
 
 
+def test_restore_stashed_changes_can_default_to_no_prompt(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(hermes_main.subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("unexpected subprocess call")))
+    monkeypatch.setattr("builtins.input", lambda: "")
+
+    restored = hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, "abc123", prompt_user=True, default_answer="n"
+    )
+
+    assert restored is False
+    out = capsys.readouterr().out
+    assert "Restore local changes now? [y/N]" in out
+    assert "Your changes are still preserved in git stash." in out
+
+
 def test_restore_stashed_changes_applies_without_prompt_when_disabled(monkeypatch, tmp_path, capsys):
     calls = []
 
@@ -474,10 +488,16 @@ def test_cmd_update_switches_to_main_from_feature_branch(monkeypatch, tmp_path, 
 
     checkout_calls = [c for c in recorded if "checkout" in c and "main" in c]
     assert len(checkout_calls) == 1
+    checkout_back = [c for c in recorded if "checkout" in c and "fix/something" in c]
+    assert len(checkout_back) == 1
+    merge_calls = [c for c in recorded if c[:4] == ["git", "merge", "--no-edit", "main"]]
+    assert len(merge_calls) == 1
 
     out = capsys.readouterr().out
     assert "fix/something" in out
     assert "switching to main" in out
+    assert "Switching back to fix/something" in out
+    assert "Merging main into fix/something" in out
 
 
 def test_cmd_update_switches_to_main_from_detached_head(monkeypatch, tmp_path, capsys):
@@ -543,6 +563,61 @@ def test_cmd_update_no_checkout_when_already_on_main(monkeypatch, tmp_path):
 
     checkout_calls = [c for c in recorded if "checkout" in c]
     assert len(checkout_calls) == 0
+
+
+def test_cmd_update_fork_merges_upstream_then_returns_to_work_branch(monkeypatch, tmp_path, capsys):
+    """Fork updates should merge upstream into main, then switch back and merge main into work."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    recorded = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_get_origin_url",
+        lambda *a, **kw: "https://github.com/jackylai2660707/hermes-agent.git",
+    )
+
+    def fake_run(cmd, **kwargs):
+        recorded.append(cmd)
+        if cmd == ["git", "fetch", "origin"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return SimpleNamespace(stdout="work\n", stderr="", returncode=0)
+        if cmd == ["git", "checkout", "main"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+            return SimpleNamespace(stdout="0\n", stderr="", returncode=0)
+        if cmd == ["git", "remote", "get-url", "upstream"]:
+            return SimpleNamespace(stdout="https://github.com/NousResearch/hermes-agent.git\n", stderr="", returncode=0)
+        if cmd == ["git", "fetch", "upstream", "--quiet"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "--count", "upstream/main..HEAD"]:
+            return SimpleNamespace(stdout="4\n", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "--count", "HEAD..upstream/main"]:
+            return SimpleNamespace(stdout="2\n", stderr="", returncode=0)
+        if cmd == ["git", "merge", "--no-edit", "upstream/main"]:
+            return SimpleNamespace(stdout="Merge made\n", stderr="", returncode=0)
+        if cmd == ["git", "push", "origin", "main", "--force-with-lease"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "checkout", "work"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "merge", "--no-edit", "main"]:
+            return SimpleNamespace(stdout="Merge made\n", stderr="", returncode=0)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["git", "merge", "--no-edit", "upstream/main"] in recorded
+    assert ["git", "checkout", "work"] in recorded
+    assert ["git", "merge", "--no-edit", "main"] in recorded
+
+    out = capsys.readouterr().out
+    assert "Updating from fork" in out
+    assert "Merging 2 upstream commit(s) into local main" in out
+    assert "Switching back to work" in out
+    assert "Merging main into work" in out
 
 
 # ---------------------------------------------------------------------------

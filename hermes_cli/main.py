@@ -3170,17 +3170,22 @@ def _restore_stashed_changes(
     stash_ref: str,
     prompt_user: bool = False,
     input_fn=None,
+    default_answer: str = "y",
 ) -> bool:
     if prompt_user:
         print()
         print("⚠ Local changes were stashed before updating.")
         print("  Restoring them may reapply local customizations onto the updated codebase.")
         print("  Review the result afterward if Hermes behaves unexpectedly.")
-        print("Restore local changes now? [Y/n]")
+        prompt = "Restore local changes now? [Y/n]" if default_answer.lower() in ("", "y", "yes") else "Restore local changes now? [y/N]"
+        print(prompt)
         if input_fn is not None:
-            response = input_fn("Restore local changes now? [Y/n]", "y")
+            response = input_fn(prompt, default_answer)
         else:
             response = input().strip().lower()
+        normalized_default = default_answer.strip().lower() if default_answer else ""
+        if response == "":
+            response = normalized_default
         if response not in ("", "y", "yes"):
             print("Skipped restoring local changes.")
             print("Your changes are still preserved in git stash.")
@@ -3384,21 +3389,27 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
         return False
 
 
-def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
-    """Check if fork is behind upstream and sync if safe.
+def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> Optional[bool]:
+    """Sync local ``main`` with ``upstream/main`` when this checkout is a fork.
+
+    Returns:
+    - True if local ``main`` changed.
+    - False if no upstream changes were needed.
+    - None if the sync failed and manual intervention is needed.
 
     This implements the fork upstream sync logic:
     - If upstream remote doesn't exist, ask user if they want to add it
-    - Compare origin/main with upstream/main
-    - If origin/main is strictly behind upstream/main, pull from upstream
-    - Try to sync fork back to origin if possible
+    - Compare the current local ``main`` with ``upstream/main``
+    - Fast-forward when possible
+    - Otherwise merge ``upstream/main`` into local ``main`` so fork commits stay intact
+    - Try to sync the fork back to origin if possible
     """
     has_upstream = _has_upstream_remote(git_cmd, cwd)
 
     if not has_upstream:
         # Check if user previously declined
         if _should_skip_upstream_prompt():
-            return
+            return False
 
         # Ask user if they want to add upstream
         print()
@@ -3418,11 +3429,11 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
                 has_upstream = True
             else:
                 print("  ✗ Failed to add upstream remote. Skipping upstream sync.")
-                return
+                return None
         else:
             print("  Skipped. Run 'git remote add upstream https://github.com/NousResearch/hermes-agent.git' to add later.")
             _mark_skip_upstream_prompt()
-            return
+            return False
 
     # Fetch upstream
     print()
@@ -3436,44 +3447,58 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         )
     except subprocess.CalledProcessError:
         print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
-        return
+        return None
 
-    # Compare origin/main with upstream/main
-    origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
-    upstream_ahead = _count_commits_between(git_cmd, cwd, "origin/main", "upstream/main")
+    # Compare local main (HEAD) with upstream/main. ``cmd_update`` ensures we're on
+    # main before calling this helper.
+    local_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "HEAD")
+    upstream_ahead = _count_commits_between(git_cmd, cwd, "HEAD", "upstream/main")
 
-    if origin_ahead < 0 or upstream_ahead < 0:
+    if local_ahead < 0 or upstream_ahead < 0:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
-        return
+        return None
 
-    # If origin/main has commits not on upstream, don't trample
-    if origin_ahead > 0:
-        print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
-        return
-
-    # If upstream is not ahead, fork is up to date
     if upstream_ahead == 0:
-        print("  ✓ Fork is up to date with upstream")
-        return
+        if local_ahead > 0:
+            print()
+            print(f"ℹ Local main has {local_ahead} fork commit(s) not on upstream.")
+            print("  ✓ No new upstream commits to merge")
+        else:
+            print("  ✓ Fork is up to date with upstream")
+        return False
 
-    # origin/main is strictly behind upstream/main (can fast-forward)
-    print()
-    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
-    print("→ Pulling from upstream...")
-
-    try:
-        subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
+    # Local main has fork commits and upstream also moved: merge instead of skipping.
+    if local_ahead > 0:
+        print()
+        print(f"ℹ Local main has {local_ahead} fork commit(s) not on upstream.")
+        print(f"→ Merging {upstream_ahead} upstream commit(s) into local main...")
+        merge_result = subprocess.run(
+            git_cmd + ["merge", "--no-edit", "upstream/main"],
             cwd=cwd,
-            check=True,
+            capture_output=True,
+            text=True,
         )
-    except subprocess.CalledProcessError:
-        print("  ✗ Failed to pull from upstream. You may need to resolve conflicts manually.")
-        return
+        if merge_result.returncode != 0:
+            print("  ✗ Failed to merge upstream/main into local main.")
+            stderr = (merge_result.stderr or "").strip()
+            if stderr:
+                print(f"  {stderr.splitlines()[0]}")
+            print("  Resolve the merge on main manually, then rerun `hermes update`.")
+            return None
+    else:
+        print()
+        print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
+        print("→ Pulling from upstream...")
+
+        try:
+            subprocess.run(
+                git_cmd + ["pull", "--ff-only", "upstream", "main"],
+                cwd=cwd,
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            print("  ✗ Failed to pull from upstream. You may need to resolve conflicts manually.")
+            return None
 
     print("  ✓ Updated from upstream")
 
@@ -3484,6 +3509,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     else:
         print("  ℹ Got updates from upstream but couldn't push to fork (no write access?)")
         print("    Your local repo is updated, but your fork on GitHub may be behind.")
+    return True
 
 
 def _invalidate_update_cache():
@@ -3681,6 +3707,7 @@ def cmd_update(args):
 
         # Always update against main
         branch = "main"
+        original_branch = current_branch if current_branch not in ("main", "HEAD") else None
 
         # If user is on a non-main branch or detached HEAD, switch to main
         if current_branch != "main":
@@ -3701,6 +3728,7 @@ def cmd_update(args):
         prompt_for_restore = auto_stash_ref is not None and (
             gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty())
         )
+        restore_default_answer = "n" if original_branch else "y"
 
         # Check if there are updates
         result = subprocess.run(
@@ -3712,70 +3740,45 @@ def cmd_update(args):
         )
         commit_count = int(result.stdout.strip())
 
-        if commit_count == 0:
-            _invalidate_update_cache()
-            # Restore stash and switch back to original branch if we moved
-            if auto_stash_ref is not None:
-                _restore_stashed_changes(
-                    git_cmd, PROJECT_ROOT, auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
-                )
-            if current_branch not in ("main", "HEAD"):
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=PROJECT_ROOT, capture_output=True, text=True, check=False,
-                )
-            print("✓ Already up to date!")
-            return
-
-        print(f"→ Found {commit_count} new commit(s)")
+        origin_updated = commit_count > 0
+        if origin_updated:
+            print(f"→ Found {commit_count} new commit(s)")
 
         print("→ Pulling updates...")
         update_succeeded = False
         try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print("  ⚠ Fast-forward not possible (history diverged), resetting to match remote...")
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+            if origin_updated:
+                pull_result = subprocess.run(
+                    git_cmd + ["pull", "--ff-only", "origin", branch],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print("  Try manually: git fetch origin && git reset --hard origin/main")
-                    sys.exit(1)
+                if pull_result.returncode != 0:
+                    # ff-only failed — local and remote have diverged (e.g. upstream
+                    # force-pushed or rebase).  Since local changes are already
+                    # stashed, reset to match the remote exactly.
+                    print("  ⚠ Fast-forward not possible (history diverged), resetting to match remote...")
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print("  Try manually: git fetch origin && git reset --hard origin/main")
+                        sys.exit(1)
             update_succeeded = True
         finally:
-            if auto_stash_ref is not None:
+            if auto_stash_ref is not None and not update_succeeded:
                 # Don't attempt stash restore if the code update itself failed —
                 # working tree is in an unknown state.
-                if not update_succeeded:
-                    print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
-                    print(f"  Restore manually with: git stash apply")
-                else:
-                    _restore_stashed_changes(
-                        git_cmd,
-                        PROJECT_ROOT,
-                        auto_stash_ref,
-                        prompt_user=prompt_for_restore,
-                        input_fn=gw_input_fn,
-                    )
+                print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
+                print(f"  Restore manually with: git stash apply")
         
-        _invalidate_update_cache()
-
         # Clear stale .pyc bytecode cache — prevents ImportError on gateway
         # restart when updated source references names that didn't exist in
         # the old bytecode (e.g. get_hermes_home added to hermes_constants).
@@ -3784,8 +3787,76 @@ def cmd_update(args):
             print(f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}")
 
         # Fork upstream sync logic (only for main branch on forks)
+        upstream_sync_result = False
         if is_fork and branch == "main":
-            _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+            upstream_sync_result = _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+            if upstream_sync_result is None:
+                sys.exit(1)
+
+        any_code_updates = origin_updated or bool(upstream_sync_result)
+        if not any_code_updates:
+            _invalidate_update_cache()
+            if auto_stash_ref is not None:
+                _restore_stashed_changes(
+                    git_cmd, PROJECT_ROOT, auto_stash_ref,
+                    prompt_user=prompt_for_restore,
+                    input_fn=gw_input_fn,
+                    default_answer=restore_default_answer,
+                )
+            if original_branch:
+                subprocess.run(
+                    git_cmd + ["checkout", original_branch],
+                    cwd=PROJECT_ROOT, capture_output=True, text=True, check=False,
+                )
+            print("✓ Already up to date!")
+            return
+
+        if original_branch:
+            print()
+            print(f"→ Switching back to {original_branch}...")
+            checkout_back = subprocess.run(
+                git_cmd + ["checkout", original_branch],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            if checkout_back.returncode != 0:
+                print(f"✗ Failed to switch back to {original_branch}.")
+                stderr = (checkout_back.stderr or "").strip()
+                if stderr:
+                    print(f"  {stderr.splitlines()[0]}")
+                if auto_stash_ref is not None:
+                    print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
+                sys.exit(1)
+
+            print(f"→ Merging main into {original_branch}...")
+            merge_back = subprocess.run(
+                git_cmd + ["merge", "--no-edit", "main"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            if merge_back.returncode != 0:
+                print(f"✗ Failed to merge main into {original_branch}.")
+                stderr = (merge_back.stderr or "").strip()
+                if stderr:
+                    print(f"  {stderr.splitlines()[0]}")
+                if auto_stash_ref is not None:
+                    print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
+                    print("  Restore manually after resolving the merge: git stash apply")
+                sys.exit(1)
+
+        if auto_stash_ref is not None:
+            _restore_stashed_changes(
+                git_cmd,
+                PROJECT_ROOT,
+                auto_stash_ref,
+                prompt_user=prompt_for_restore,
+                input_fn=gw_input_fn,
+                default_answer=restore_default_answer,
+            )
+
+        _invalidate_update_cache()
         
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras
