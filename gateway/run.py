@@ -509,6 +509,22 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     return None
 
 
+def _restart_should_use_service_manager() -> bool:
+    """Return True when /restart should delegate to the active service manager."""
+    try:
+        from hermes_cli.gateway import _is_service_running, supports_systemd_services
+    except Exception:
+        return False
+
+    if not supports_systemd_services():
+        return False
+
+    try:
+        return _is_service_running()
+    except Exception:
+        return False
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -4148,7 +4164,11 @@ class GatewayRunner:
             return "⏳ Gateway restart already in progress..."
 
         active_agents = self._running_agent_count()
-        self.request_restart(detached=True, via_service=False)
+        restart_via_service = _restart_should_use_service_manager()
+        self.request_restart(
+            detached=not restart_via_service,
+            via_service=restart_via_service,
+        )
         if active_agents:
             return f"⏳ Draining {active_agents} active agent(s) before restart..."
         return "♻ Restarting gateway..."

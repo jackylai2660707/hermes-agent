@@ -13,23 +13,73 @@ from tests.gateway.restart_test_helpers import make_restart_runner, make_restart
 
 
 @pytest.mark.asyncio
-async def test_restart_command_while_busy_requests_drain_without_interrupt():
+async def test_restart_command_while_busy_requests_drain_without_interrupt(monkeypatch):
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        gateway_run,
+        "_restart_should_use_service_manager",
+        MagicMock(return_value=False),
+    )
+    source = make_restart_source()
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m1",
+    )
+    session_key = build_session_key(source)
+    running_agent = MagicMock()
+    runner._running_agents[session_key] = running_agent
+
+    result = await runner._handle_restart_command(event)
+
+    assert result == "⏳ Draining 1 active agent(s) before restart..."
+    running_agent.interrupt.assert_not_called()
+    runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+
+
+@pytest.mark.asyncio
+async def test_restart_command_uses_service_restart_when_systemd_managed(monkeypatch):
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        gateway_run,
+        "_restart_should_use_service_manager",
+        MagicMock(return_value=True),
+    )
     event = MessageEvent(
         text="/restart",
         message_type=MessageType.TEXT,
         source=make_restart_source(),
-        message_id="m1",
+        message_id="m1b",
     )
-    session_key = build_session_key(event.source)
-    running_agent = MagicMock()
-    runner._running_agents[session_key] = running_agent
 
-    result = await runner._handle_message(event)
+    result = await runner._handle_restart_command(event)
 
-    assert result == "⏳ Draining 1 active agent(s) before restart..."
-    running_agent.interrupt.assert_not_called()
+    assert result == "♻ Restarting gateway..."
+    runner.request_restart.assert_called_once_with(detached=False, via_service=True)
+
+
+@pytest.mark.asyncio
+async def test_restart_command_uses_detached_restart_when_not_service_managed(monkeypatch):
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        gateway_run,
+        "_restart_should_use_service_manager",
+        MagicMock(return_value=False),
+    )
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m1c",
+    )
+
+    result = await runner._handle_restart_command(event)
+
+    assert result == "♻ Restarting gateway..."
     runner.request_restart.assert_called_once_with(detached=True, via_service=False)
 
 
@@ -63,16 +113,17 @@ async def test_draining_rejects_new_session_messages():
     runner._draining = True
     runner._restart_requested = True
 
-    event = MessageEvent(
-        text="hello",
-        message_type=MessageType.TEXT,
-        source=make_restart_source("fresh"),
-        message_id="m3",
+    result = await runner._handle_active_session_busy_message(
+        MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=make_restart_source("fresh"),
+            message_id="m3",
+        ),
+        build_session_key(make_restart_source("fresh")),
     )
 
-    result = await runner._handle_message(event)
-
-    assert result == "⏳ Gateway is restarting and is not accepting new work right now."
+    assert result is True
 
 
 def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, monkeypatch):
