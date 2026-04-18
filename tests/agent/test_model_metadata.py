@@ -132,6 +132,16 @@ class TestDefaultContextLengths:
             if "gpt-4.1" in key:
                 assert value == 1047576, f"{key} should be 1047576"
 
+    def test_gpt54_family_context_lengths(self):
+        expected = {
+            "gpt-5.4": 1050000,
+            "gpt-5.4-pro": 1050000,
+            "gpt-5.4-mini": 400000,
+            "gpt-5.4-nano": 400000,
+        }
+        for key, value in expected.items():
+            assert DEFAULT_CONTEXT_LENGTHS[key] == value
+
     def test_gemini_models_1m(self):
         for key, value in DEFAULT_CONTEXT_LENGTHS.items():
             if "gemini" in key:
@@ -246,6 +256,12 @@ class TestGetModelContextLength:
         assert get_model_context_length("qwen3-plus") == 131072
 
     @patch("agent.model_metadata.fetch_model_metadata")
+    def test_gpt54_mini_uses_specific_default_not_generic_gpt5(self, mock_fetch):
+        """GPT-5.4 mini should not fall back to the generic 128K GPT-5 default."""
+        mock_fetch.return_value = {}
+        assert get_model_context_length("gpt-5.4-mini") == 400000
+
+    @patch("agent.model_metadata.fetch_model_metadata")
     def test_api_missing_context_length_key(self, mock_fetch):
         """Model in API but without context_length → defaults to 128000."""
         mock_fetch.return_value = {"test/model": {"name": "Test"}}
@@ -287,6 +303,21 @@ class TestGetModelContextLength:
         )
 
         assert result == 65536
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_custom_endpoint_without_metadata_uses_exact_hardcoded_default(self, mock_endpoint_fetch, mock_fetch):
+        """Unknown custom endpoints may still use exact hardcoded defaults for well-known model IDs."""
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {}
+
+        result = get_model_context_length(
+            "gpt-5.4-mini",
+            base_url="https://api.yueseng-ys.com/v1",
+            api_key="test-key",
+        )
+
+        assert result == 400000
 
     @patch("agent.model_metadata.fetch_model_metadata")
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")

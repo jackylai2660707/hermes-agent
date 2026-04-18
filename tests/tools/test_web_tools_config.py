@@ -63,6 +63,38 @@ class TestFirecrawlClientConfig:
 
     # ── Configuration matrix ─────────────────────────────────────────
 
+    def test_cloud_mode_key_only(self):
+        """API key without URL → cloud Firecrawl."""
+        with patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}):
+            with patch("tools.web_tools.Firecrawl") as mock_fc:
+                from tools.web_tools import _get_firecrawl_client
+                result = _get_firecrawl_client()
+                mock_fc.assert_called_once_with(api_key="fc-test")
+                assert result is mock_fc.return_value
+
+    def test_self_hosted_with_key(self):
+        """Both key + URL → self-hosted with auth."""
+        with patch.dict(os.environ, {
+            "FIRECRAWL_API_KEY": "fc-test",
+            "FIRECRAWL_API_URL": "http://localhost:3002",
+        }):
+            with patch("tools.web_tools.Firecrawl") as mock_fc:
+                from tools.web_tools import _get_firecrawl_client
+                result = _get_firecrawl_client()
+                mock_fc.assert_called_once_with(
+                    api_key="fc-test", api_url="http://localhost:3002"
+                )
+                assert result is mock_fc.return_value
+
+    def test_self_hosted_no_key(self):
+        """URL only, no key → self-hosted without auth."""
+        with patch.dict(os.environ, {"FIRECRAWL_API_URL": "http://localhost:3002"}):
+            with patch("tools.web_tools.Firecrawl") as mock_fc:
+                from tools.web_tools import _get_firecrawl_client
+                result = _get_firecrawl_client()
+                mock_fc.assert_called_once_with(api_url="http://localhost:3002")
+                assert result is mock_fc.return_value
+
     def test_no_config_raises_with_helpful_message(self):
         """Neither key nor URL → ValueError with guidance."""
         with patch("tools.web_tools.Firecrawl"):
@@ -446,6 +478,149 @@ class TestParallelClientConfig:
             client1 = _get_parallel_client()
             client2 = _get_parallel_client()
             assert client1 is client2
+
+
+class TestDirectFirecrawlPathPrefix:
+    def setup_method(self):
+        import tools.web_tools
+        tools.web_tools._firecrawl_client = None
+        tools.web_tools._firecrawl_client_config = None
+
+    def teardown_method(self):
+        import tools.web_tools
+        tools.web_tools._firecrawl_client = None
+        tools.web_tools._firecrawl_client_config = None
+
+    def test_direct_firecrawl_base_url_preserves_v2_path_prefix(self):
+        with patch.dict(os.environ, {
+            "FIRECRAWL_API_URL": "https://search.mo.yueseng-ys.com/firecrawl/v2",
+            "FIRECRAWL_API_KEY": "fc-test",
+        }, clear=False):
+            from tools.web_tools import _get_direct_firecrawl_base_url
+            assert _get_direct_firecrawl_base_url() == "https://search.mo.yueseng-ys.com/firecrawl/v2"
+
+    def test_firecrawl_search_uses_direct_http_for_path_prefixed_instances(self):
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {
+            "success": True,
+            "data": {
+                "web": [
+                    {"url": "https://example.com", "title": "Example", "description": "desc", "position": 1}
+                ]
+            },
+        }
+
+        with patch.dict(os.environ, {
+            "FIRECRAWL_API_URL": "https://search.mo.yueseng-ys.com/firecrawl/v2",
+            "FIRECRAWL_API_KEY": "fc-test",
+        }, clear=False), patch(
+            "tools.web_tools.httpx.post",
+            return_value=mock_response,
+        ) as mock_post, patch("tools.interrupt.is_interrupted", return_value=False):
+            from tools.web_tools import web_search_tool
+            result = json.loads(web_search_tool("example domain", limit=3))
+
+        assert result["success"] is True
+        mock_post.assert_called_once()
+        assert mock_post.call_args.args[0] == "https://search.mo.yueseng-ys.com/firecrawl/v2/search"
+
+    @pytest.mark.asyncio
+    async def test_firecrawl_scrape_uses_direct_http_for_path_prefixed_instances(self):
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {
+            "success": True,
+            "data": {
+                "markdown": "# Example Domain",
+                "metadata": {"title": "Example Domain", "sourceURL": "https://example.com"},
+            },
+        }
+
+        with patch.dict(os.environ, {
+            "FIRECRAWL_API_URL": "https://search.mo.yueseng-ys.com/firecrawl/v2",
+            "FIRECRAWL_API_KEY": "fc-test",
+        }, clear=False), patch(
+            "tools.web_tools.httpx.post",
+            return_value=mock_response,
+        ) as mock_post, patch(
+            "tools.web_tools.process_content_with_llm",
+            return_value=None,
+        ), patch(
+            "tools.web_tools._get_default_summarizer_model",
+            return_value=None,
+        ), patch(
+            "tools.web_tools.check_auxiliary_model",
+            return_value=False,
+        ):
+            from tools.web_tools import web_extract_tool
+            result = json.loads(
+                await web_extract_tool(["https://example.com"], use_llm_processing=False)
+            )
+
+        assert result["results"][0]["title"] == "Example Domain"
+        assert any(
+            call.args[0] == "https://search.mo.yueseng-ys.com/firecrawl/v2/scrape"
+            for call in mock_post.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_firecrawl_crawl_uses_direct_http_for_path_prefixed_instances(self):
+        create_response = MagicMock()
+        create_response.raise_for_status.return_value = None
+        create_response.json.return_value = {"success": True, "id": "crawl-123"}
+
+        poll_response = MagicMock()
+        poll_response.raise_for_status.return_value = None
+        poll_response.json.return_value = {
+            "status": "completed",
+            "data": [
+                {
+                    "markdown": "# Example Domain",
+                    "metadata": {"title": "Example Domain", "sourceURL": "https://example.com/docs"},
+                }
+            ],
+        }
+
+        with patch.dict(os.environ, {
+            "FIRECRAWL_API_URL": "https://search.mo.yueseng-ys.com/firecrawl/v2",
+            "FIRECRAWL_API_KEY": "fc-test",
+        }, clear=False), patch(
+            "tools.web_tools.httpx.post",
+            return_value=create_response,
+        ) as mock_post, patch(
+            "tools.web_tools.httpx.get",
+            return_value=poll_response,
+        ) as mock_get, patch(
+            "tools.web_tools.check_auxiliary_model",
+            return_value=False,
+        ), patch(
+            "tools.web_tools._get_default_summarizer_model",
+            return_value=None,
+        ), patch(
+            "tools.web_tools.check_website_access",
+            return_value=None,
+        ), patch(
+            "tools.web_tools.is_safe_url",
+            return_value=True,
+        ), patch(
+            "tools.interrupt.is_interrupted",
+            return_value=False,
+        ):
+            from tools.web_tools import web_crawl_tool
+            result = json.loads(
+                await web_crawl_tool("https://example.com", use_llm_processing=False)
+            )
+
+        assert result["results"][0]["url"] == "https://example.com/docs"
+        assert any(
+            call.args[0] == "https://search.mo.yueseng-ys.com/firecrawl/v2/crawl"
+            for call in mock_post.call_args_list
+        )
+        assert any(
+            call.args[0] == "https://search.mo.yueseng-ys.com/firecrawl/v2/crawl/crawl-123"
+            for call in mock_get.call_args_list
+        )
 
 
 class TestWebSearchErrorHandling:

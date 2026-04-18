@@ -111,14 +111,16 @@ DEFAULT_CONTEXT_LENGTHS = {
     "claude-sonnet-4.6": 1000000,
     # Catch-all for older Claude models (must sort after specific entries)
     "claude": 200000,
-    # OpenAI — GPT-5 family (most have 400k; specific overrides first)
+    # OpenAI — GPT-5 family (specific overrides first)
     # Source: https://developers.openai.com/api/docs/models
-    "gpt-5.4-nano": 400000,           # 400k (not 1.05M like full 5.4)
-    "gpt-5.4-mini": 400000,           # 400k (not 1.05M like full 5.4)
-    "gpt-5.4": 1050000,               # GPT-5.4, GPT-5.4 Pro (1.05M context)
-    "gpt-5.3-codex-spark": 128000,    # Spark variant has reduced 128k context
-    "gpt-5.1-chat": 128000,           # Chat variant has 128k context
-    "gpt-5": 400000,                  # GPT-5.x base, mini, codex variants (400k)
+    # These explicit keys must sort ahead of the generic "gpt-5" fallback.
+    "gpt-5.4-pro": 1_050_000,
+    "gpt-5.4": 1_050_000,
+    "gpt-5.4-mini": 400_000,
+    "gpt-5.4-nano": 400_000,
+    "gpt-5.3-codex-spark": 128000,
+    "gpt-5.1-chat": 128000,
+    "gpt-5": 400000,
     "gpt-4.1": 1047576,
     "gpt-4": 128000,
     # Google
@@ -874,6 +876,15 @@ def _normalize_model_version(model: str) -> str:
     return model.replace(".", "-")
 
 
+def _lookup_exact_default_context_length(model: str) -> Optional[int]:
+    """Return a hardcoded default only for an exact model-ID match."""
+    normalized = _strip_provider_prefix(model).strip().lower()
+    for default_model, length in DEFAULT_CONTEXT_LENGTHS.items():
+        if default_model.lower() == normalized:
+            return length
+    return None
+
+
 def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> Optional[int]:
     """Query Anthropic's /v1/models endpoint for context length.
 
@@ -1003,6 +1014,9 @@ def get_model_context_length(
                 if local_ctx and local_ctx > 0:
                     save_context_length(model, base_url, local_ctx)
                     return local_ctx
+            exact_default = _lookup_exact_default_context_length(model)
+            if exact_default is not None:
+                return exact_default
             logger.info(
                 "Could not detect context length for model %r at %s — "
                 "defaulting to %s tokens (probe-down). Set model.context_length "

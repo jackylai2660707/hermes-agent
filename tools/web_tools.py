@@ -53,6 +53,7 @@ from agent.auxiliary_client import (
     extract_content_or_reasoning,
     get_async_text_auxiliary_client,
 )
+from hermes_constants import get_hermes_home
 from tools.debug_helpers import DebugSession
 from tools.managed_tool_gateway import (
     build_vendor_gateway_url,
@@ -64,6 +65,38 @@ from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
+
+
+def _bootstrap_web_env() -> None:
+    """Load Hermes env-file web credentials when the runtime env is empty."""
+    env_path = get_hermes_home() / ".env"
+    if not env_path.exists():
+        return
+
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key or key in os.environ:
+                continue
+            value = value.strip()
+            if (value.startswith('"') and value.endswith('"')) or (
+                value.startswith("'") and value.endswith("'")
+            ):
+                value = value[1:-1]
+            os.environ[key] = value
+    except Exception as exc:
+        logger.debug("Skipping Hermes env bootstrap: %s", exc)
+
+
+_bootstrap_web_env()
 
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
@@ -126,12 +159,26 @@ _firecrawl_client_config = None
 
 
 def _get_direct_firecrawl_config() -> Optional[tuple[Dict[str, str], tuple[str, Optional[str], Optional[str]]]]:
-    """Return explicit direct Firecrawl kwargs + cache key, or None when unset."""
-    api_key = os.getenv("FIRECRAWL_API_KEY", "").strip()
-    api_url = os.getenv("FIRECRAWL_API_URL", "").strip().rstrip("/")
+    """Return explicit direct Firecrawl kwargs + cache key, or None when unset.
 
-    if not api_key and not api_url:
+    Some reverse-proxied Firecrawl deployments authenticate with a proxy token
+    instead of the upstream Firecrawl key. When the configured API URL points at
+    MySearch's Firecrawl proxy, prefer ``MYSEARCH_PROXY_API_KEY`` if present so
+    Hermes can use the proxied Firecrawl path without conflating it with the
+    upstream Firecrawl credential.
+    """
+    api_url = os.getenv("FIRECRAWL_API_URL", "").strip().rstrip("/")
+    api_key = os.getenv("FIRECRAWL_API_KEY", "").strip()
+    proxy_key = os.getenv("MYSEARCH_PROXY_API_KEY", "").strip()
+
+    if not api_key and not api_url and not proxy_key:
         return None
+
+    if api_url and "mysearch.armjp.yueseng-ys.com" in api_url and proxy_key:
+        api_key = proxy_key
+
+    if not api_key:
+        api_key = proxy_key or api_key
 
     kwargs: Dict[str, str] = {}
     if api_key:
@@ -139,7 +186,139 @@ def _get_direct_firecrawl_config() -> Optional[tuple[Dict[str, str], tuple[str, 
     if api_url:
         kwargs["api_url"] = api_url
 
-    return kwargs, ("direct", api_url or None, api_key or None)
+    cache_key = ("direct", api_url or None, api_key or None)
+    return kwargs, cache_key
+
+
+def _get_direct_firecrawl_base_url() -> Optional[str]:
+    """Return a direct Firecrawl base URL normalized to the v2 API root."""
+    direct_config = _get_direct_firecrawl_config()
+    if direct_config is None:
+        return None
+
+    kwargs, _ = direct_config
+    api_url = (kwargs.get("api_url") or "").strip().rstrip("/")
+    if not api_url:
+        return None
+    if api_url.endswith("/v2"):
+        return api_url
+    return f"{api_url}/v2"
+
+
+def _firecrawl_direct_post(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST to a direct Firecrawl endpoint without dropping any path prefix."""
+    direct_config = _get_direct_firecrawl_config()
+    if direct_config is None:
+        _raise_web_backend_configuration_error()
+
+    kwargs, _ = direct_config
+    api_key = (kwargs.get("api_key") or "").strip()
+    base_url = _get_direct_firecrawl_base_url()
+    if not base_url:
+        _raise_web_backend_configuration_error()
+
+    url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    response = httpx.post(url, headers=headers, json=dict(payload), timeout=60)
+    response.raise_for_status()
+    body = response.json()
+    if not body.get("success", False):
+        raise ValueError(body.get("error") or f"Firecrawl {endpoint} failed")
+    return body
+
+
+def _firecrawl_direct_get(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """GET a direct Firecrawl endpoint without dropping any path prefix."""
+    direct_config = _get_direct_firecrawl_config()
+    if direct_config is None:
+        _raise_web_backend_configuration_error()
+
+    kwargs, _ = direct_config
+    api_key = (kwargs.get("api_key") or "").strip()
+    base_url = _get_direct_firecrawl_base_url()
+    if not base_url:
+        _raise_web_backend_configuration_error()
+
+    url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    response = httpx.get(url, headers=headers, params=params or {}, timeout=60)
+    response.raise_for_status()
+    body = response.json()
+    if isinstance(body, dict) and body.get("success") is False:
+        raise ValueError(body.get("error") or f"Firecrawl {endpoint} failed")
+    return body
+
+
+async def _firecrawl_direct_crawl(url: str, crawl_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Start and poll a direct Firecrawl crawl until it returns page data."""
+    create_payload = {
+        "url": url,
+        "limit": int(crawl_params.get("limit", 20) or 20),
+    }
+    body = _firecrawl_direct_post("crawl", create_payload)
+
+    if isinstance(body, dict) and isinstance(body.get("data"), list) and body.get("data"):
+        return {"data": body["data"]}
+
+    job_id = str(body.get("id") or body.get("jobId") or "").strip()
+    if not job_id:
+        if isinstance(body, dict) and "data" in body:
+            return {"data": body.get("data") or []}
+        raise ValueError("Firecrawl crawl did not return a job id")
+
+    poll_interval = 2.0
+    timeout_seconds = 180.0
+    deadline = asyncio.get_event_loop().time() + timeout_seconds
+    last_body: Dict[str, Any] = body if isinstance(body, dict) else {}
+    in_progress_states = {
+        "queued",
+        "pending",
+        "processing",
+        "scraping",
+        "running",
+        "started",
+    }
+
+    while True:
+        if asyncio.get_event_loop().time() >= deadline:
+            break
+        try:
+            polled = _firecrawl_direct_get(f"crawl/{job_id}")
+        except Exception as exc:
+            error_text = str(exc).lower()
+            if any(code in error_text for code in ("404", "502", "503", "504", "429")):
+                await asyncio.sleep(poll_interval)
+                continue
+            raise
+        if isinstance(polled, dict):
+            last_body = polled
+            status = str(polled.get("status") or "").strip().lower()
+            data = polled.get("data")
+            completed = polled.get("completed")
+            total = polled.get("total")
+            if isinstance(data, list) and data and status not in in_progress_states:
+                return {"data": data}
+            if (
+                isinstance(data, list)
+                and data
+                and isinstance(completed, int)
+                and isinstance(total, int)
+                and completed >= total
+            ):
+                return {"data": data}
+        await asyncio.sleep(poll_interval)
+
+    if isinstance(last_body, dict) and isinstance(last_body.get("data"), list) and last_body.get("data"):
+        return {"data": last_body["data"]}
+    raise TimeoutError(
+        f"Firecrawl crawl job {job_id} did not complete within {timeout_seconds:.0f}s"
+    )
 
 
 def _get_firecrawl_gateway_url() -> str:
@@ -298,9 +477,12 @@ def _tavily_request(endpoint: str, payload: dict) -> dict:
             "Get your API key at https://app.tavily.com/home"
         )
     payload["api_key"] = api_key
+    headers = {"Content-Type": "application/json"}
+    if "api.yueseng-ys.com" not in _TAVILY_BASE_URL:
+        headers["Authorization"] = f"Bearer {api_key}"
     url = f"{_TAVILY_BASE_URL}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
-    response = httpx.post(url, json=payload, timeout=60)
+    response = httpx.post(url, json=payload, headers=headers, timeout=60)
     response.raise_for_status()
     return response.json()
 
@@ -1120,10 +1302,16 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
 
-        response = _get_firecrawl_client().search(
-            query=query,
-            limit=limit
-        )
+        if _has_direct_firecrawl_config():
+            response = _firecrawl_direct_post(
+                "search",
+                {"query": query, "limit": limit},
+            )
+        else:
+            response = _get_firecrawl_client().search(
+                query=query,
+                limit=limit
+            )
 
         web_results = _extract_web_search_results(response)
         results_count = len(web_results)
@@ -1292,9 +1480,25 @@ async def web_extract_tool(
                         try:
                             scrape_result = await asyncio.wait_for(
                                 asyncio.to_thread(
-                                    _get_firecrawl_client().scrape,
-                                    url=url,
-                                    formats=formats,
+                                    (
+                                        lambda target_url, target_formats: _extract_scrape_payload(
+                                            _firecrawl_direct_post(
+                                                "scrape",
+                                                {"url": target_url, "formats": target_formats},
+                                            )
+                                        )
+                                    )
+                                    if _has_direct_firecrawl_config()
+                                    else (
+                                        lambda target_url, target_formats: _extract_scrape_payload(
+                                            _get_firecrawl_client().scrape(
+                                                url=target_url,
+                                                formats=target_formats,
+                                            )
+                                        )
+                                    ),
+                                    url,
+                                    formats,
                                 ),
                                 timeout=60,
                             )
@@ -1305,8 +1509,7 @@ async def web_extract_tool(
                                 "error": "Scrape timed out after 60s — page may be too large or unresponsive. Try browser_navigate instead.",
                             })
                             continue
-
-                        scrape_payload = _extract_scrape_payload(scrape_result)
+                        scrape_payload = scrape_result
                         metadata = scrape_payload.get("metadata", {})
                         title = ""
                         content_markdown = scrape_payload.get("markdown")
@@ -1676,14 +1879,17 @@ async def web_crawl_tool(
         if _is_int():
             return tool_error("Interrupted", success=False)
 
-        try:
-            crawl_result = _get_firecrawl_client().crawl(
-                url=url,
-                **crawl_params
-            )
-        except Exception as e:
-            logger.debug("Crawl API call failed: %s", e)
-            raise
+        if _has_direct_firecrawl_config():
+            crawl_result = await _firecrawl_direct_crawl(url, crawl_params)
+        else:
+            try:
+                crawl_result = _get_firecrawl_client().crawl(
+                    url=url,
+                    **crawl_params
+                )
+            except Exception as e:
+                logger.debug("Crawl API call failed: %s", e)
+                raise
 
         pages: List[Dict[str, Any]] = []
         

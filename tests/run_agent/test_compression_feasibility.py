@@ -190,6 +190,24 @@ def test_feasibility_check_ignores_invalid_context_length(mock_get_client, mock_
 
 
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_gpt54_mini_no_false_warning(mock_get_client):
+    """GPT-5.4 mini should be treated as a 400K model and not warn here."""
+    agent = _make_agent(main_context=200_000, threshold_percent=0.50)
+    mock_client = MagicMock()
+    mock_client.base_url = "https://openrouter.ai/api/v1"
+    mock_client.api_key = "sk-aux"
+    mock_get_client.return_value = (mock_client, "openai/gpt-5.4-mini")
+
+    messages = []
+    agent._emit_status = lambda msg: messages.append(msg)
+
+    agent._check_compression_model_feasibility()
+
+    assert messages == []
+    assert agent._compression_warning is None
+
+
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
 def test_warns_when_no_auxiliary_provider(mock_get_client):
     """Warning emitted when no auxiliary provider is configured."""
     agent = _make_agent()
