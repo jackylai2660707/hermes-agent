@@ -511,7 +511,9 @@ class HindsightMemoryProvider(MemoryProvider):
         """Return the cached Hindsight client (created once, reused)."""
         if self._client is None:
             if self._mode == "local_embedded":
-                from hindsight import HindsightEmbedded
+                HindsightEmbedded = globals().get("HindsightEmbedded")
+                if HindsightEmbedded is None:
+                    from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
                 llm_provider = self._config.get("llm_provider", "")
                 if llm_provider in ("openai_compatible", "openrouter"):
@@ -670,11 +672,36 @@ class HindsightMemoryProvider(MemoryProvider):
                     # the daemon always starts with the right settings.
                     # If the config changed and the daemon is running, stop it.
                     from pathlib import Path as _Path
-                    profile_env = _Path.home() / ".hindsight" / "profiles" / f"{profile}.env"
+                    import pwd
+
+                    # The daemon manager may drop the child to the unprivileged
+                    # hermes user. Its ProfileManager resolves ~/.hindsight
+                    # after HOME is changed to /home/hermes, so writing the
+                    # profile under root's HOME starts a second, broken daemon
+                    # path that later fails with "initdb: cannot be run as
+                    # root". Resolve the same HINDSIGHT_HOME/profile path the
+                    # child will use instead.
+                    hindsight_home = os.environ.get("HINDSIGHT_HOME")
+                    if hindsight_home:
+                        profile_root = _Path(hindsight_home)
+                    elif os.getuid() == 0:
+                        try:
+                            profile_root = _Path(pwd.getpwnam("hermes").pw_dir) / ".hindsight"
+                        except KeyError:
+                            profile_root = _Path.home() / ".hindsight"
+                    else:
+                        profile_root = _Path.home() / ".hindsight"
+                    profile_env = profile_root / "profiles" / f"{profile}.env"
                     current_key = self._config.get("llm_api_key") or os.environ.get("HINDSIGHT_LLM_API_KEY", "")
                     current_provider = self._config.get("llm_provider", "")
                     current_model = self._config.get("llm_model", "")
                     current_base_url = self._config.get("llm_base_url") or os.environ.get("HINDSIGHT_API_LLM_BASE_URL", "")
+                    idle_timeout = (
+                        self._config.get("idle_timeout")
+                        or self._config.get("daemon_idle_timeout")
+                        or os.environ.get("HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT")
+                        or "3600"
+                    )
                     # Map openai_compatible/openrouter → openai for the daemon (OpenAI wire format)
                     daemon_provider = "openai" if current_provider in ("openai_compatible", "openrouter") else current_provider
 
@@ -690,7 +717,8 @@ class HindsightMemoryProvider(MemoryProvider):
                         saved.get("HINDSIGHT_API_LLM_PROVIDER") != daemon_provider or
                         saved.get("HINDSIGHT_API_LLM_MODEL") != current_model or
                         saved.get("HINDSIGHT_API_LLM_API_KEY") != current_key or
-                        saved.get("HINDSIGHT_API_LLM_BASE_URL", "") != current_base_url
+                        saved.get("HINDSIGHT_API_LLM_BASE_URL", "") != current_base_url or
+                        saved.get("HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT", "") != str(idle_timeout)
                     )
 
                     if config_changed:
@@ -701,6 +729,7 @@ class HindsightMemoryProvider(MemoryProvider):
                             f"HINDSIGHT_API_LLM_API_KEY={current_key}\n"
                             f"HINDSIGHT_API_LLM_MODEL={current_model}\n"
                             f"HINDSIGHT_API_LOG_LEVEL=info\n"
+                            f"HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT={idle_timeout}\n"
                         )
                         if current_base_url:
                             env_lines += f"HINDSIGHT_API_LLM_BASE_URL={current_base_url}\n"

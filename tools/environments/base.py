@@ -38,18 +38,35 @@ if _DEBUG_INTERRUPT:
     # agent.log regardless of quiet-mode.  Scoped to the opt-in case only.
     logger.setLevel(logging.INFO)
 
-# Thread-local activity callback.  The agent sets this before a tool call so
-# long-running _wait_for_process loops can report liveness to the gateway.
+# Activity callback.  The agent sets this before a tool call so long-running
+# _wait_for_process loops can report liveness to the gateway.
+#
+# Historically this was thread-local only.  That is fragile when a backend
+# uses helper/drain threads or when the execution path crosses worker-thread
+# boundaries: the poll loop can still be alive, but _get_activity_callback()
+# returns None in that other thread and the gateway sees the tool as idle.  Keep
+# the thread-local value for isolation, but also mirror the most recent callback
+# into a process-wide fallback protected by a lock.  A None set by the owning
+# thread intentionally clears the fallback after the tool finishes.
 _activity_callback_local = threading.local()
+_activity_callback_global: Callable[[str], None] | None = None
+_activity_callback_lock = threading.Lock()
 
 
 def set_activity_callback(cb: Callable[[str], None] | None) -> None:
     """Register a callback that _wait_for_process fires periodically."""
+    global _activity_callback_global
     _activity_callback_local.callback = cb
+    with _activity_callback_lock:
+        _activity_callback_global = cb
 
 
 def _get_activity_callback() -> Callable[[str], None] | None:
-    return getattr(_activity_callback_local, "callback", None)
+    cb = getattr(_activity_callback_local, "callback", None)
+    if cb is not None:
+        return cb
+    with _activity_callback_lock:
+        return _activity_callback_global
 
 
 def touch_activity_if_due(
@@ -508,6 +525,10 @@ class BaseEnvironment(ABC):
             "last_touch": _now,
             "start": _now,
         }
+        touch_activity_if_due(
+            {"last_touch": _now - 999.0, "start": _now, "interval": 0.0},
+            "terminal command started",
+        )
 
         # --- Debug tracing (opt-in via HERMES_DEBUG_INTERRUPT=1) -------------
         # Captures loop entry/exit, interrupt state changes, and periodic
@@ -609,6 +630,12 @@ class BaseEnvironment(ABC):
         # check).  A short join is enough; a long one would be a bug since
         # it means the non-blocking loop itself stopped cooperating.
         drain_thread.join(timeout=2)
+        if drain_thread.is_alive():
+            logger.warning(
+                "terminal stdout drain thread did not finish within 2s "
+                "(pid=%s); returning captured output instead of blocking",
+                getattr(proc, "pid", None),
+            )
 
         try:
             proc.stdout.close()
@@ -623,6 +650,11 @@ class BaseEnvironment(ABC):
                 time.monotonic() - _activity_state["start"],
                 proc.returncode,
             )
+
+        touch_activity_if_due(
+            {"last_touch": time.monotonic() - 999.0, "start": _activity_state["start"], "interval": 0.0},
+            "terminal command finished",
+        )
 
         return {"output": "".join(output_chunks), "returncode": proc.returncode}
 
